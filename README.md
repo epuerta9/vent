@@ -135,11 +135,11 @@ flowchart TB
     prov -- "fn.budget.record" --> budget
     orch -- "Before: fn.policy.check_permissions" --> pol
     pol -- "needs_approval → poll approvals KV" --> appr
-    orch -- "Execute: fn.tool.<name>" --> tools
+    orch -- "Execute: fn.tool.&lt;name&gt;" --> tools
     orch -- "After: fn.hook.publish_collect" --> hooks
     orch -- "provision: models + skills" --> models
     orch --> dir
-    orch == "every step emits Event → evt.<session>" ==> bus
+    orch == "every step emits Event → evt.* (per session)" ==> bus
     bus -. "evt.>" .-> sess
     bus -. "evt.>" .-> comp
     bus -. "evt.>" .-> ev
@@ -148,6 +148,11 @@ flowchart TB
     %% trace context (traceparent + session baggage) rides NATS headers on every hop,
     %% so one turn = one connected OTel trace across all workers.
 ```
+
+**More diagrams from different angles** — substrate mapping, the turn as a
+sequence, the FSM, the loop seams, the human-approval KV-watch, streaming, trace
+propagation, deployment modes, and multiplayer — are in
+[`docs/DIAGRAMS.md`](docs/DIAGRAMS.md).
 
 The same flow as a call/event trace:
 
@@ -435,33 +440,88 @@ these fell out of the substrate rather than being designed in:
 
 ## What we learned
 
-Honest findings from the spike — the good and the sharp edges:
+Honest findings from the spike, grouped by what they tell you.
 
-- **Embedded NATS is a genuinely great harness substrate.** Most of "the engine"
-  (routing, durable log, work queue, KV, blobs, clustering) is one dependency.
-  The whole thing is `go build` → one binary, no broker to run. The "in-process
-  now, cluster later, same code" property held.
+### What worked — the bet paid off
+
+- **Embedded NATS is a genuinely good harness substrate.** Most of "the engine"
+  iii writes in Rust (routing, a durable event log, a work queue, KV, blobs,
+  clustering) is *one dependency* here. The whole thing is `go build` → a single
+  binary with no broker to operate. The "in-process now, networked later,
+  clustered after that — same worker code" property held end to end.
 - **The swap thesis is real and cheap.** Adding the OpenAI-compatible provider
-  was one new `workers/provider/openai/` package + one line in the model
-  catalogue; the orchestrator never changed. Same for tools.
+  was one new `workers/provider/openai/` package plus one row in the model
+  catalogue — the orchestrator and loop never changed. A second provider, a new
+  tool, or a different policy engine is the same move: register the subject.
+- **Contract-first is what made it AI-parallelizable.** Freezing `pkg/types`
+  (wire shapes) and `pkg/bus` (the primitive) *first*, then fanning out one
+  agent per worker, worked because the workers are decoupled and share only that
+  contract. The decomposition that makes the harness composable for humans is
+  the same one that makes it generatable in parallel. That's the reusable lesson.
+- **The pi loop port stayed clean.** Keeping `pkg/agentloop` transport-agnostic
+  (it never imports NATS; it exposes Stream/Before/Execute/After) meant all the
+  bus wiring lives in the orchestrator. The seam held — you can unit-test the
+  loop with fakes and never touch the broker.
+- **Streaming + a final reply in one call maps naturally.** A provider publishes
+  token deltas to a core subject the orchestrator tails, and returns the
+  finalized message as the request reply. Live tokens *and* a clean result with
+  no extra machinery.
+- **OTel across a message bus is basically free.** Inject `traceparent` +
+  baggage into NATS headers on `Trigger`, extract on `Register`, and one turn is
+  one connected trace across every worker — zero per-worker instrumentation.
+
+### What surprised us — sharp edges & gotchas
+
 - **JetStream KV keys are restricted** to `[-/_=.a-zA-Z0-9]`. A worker used `::`
-  in skill keys and boot failed with `nats: invalid key` — switched to `.`. Easy
-  to hit; worth knowing up front.
-- **Queue groups ≠ iii's "latest registration wins".** NATS load-balances within
-  a queue group; to truly *replace* a worker you drain/stop the old instances
-  rather than relying on most-recent-registration. Arguably safer, but different.
-- **Concurrency needs CAS.** The `budget` worker does best-effort
+  in skill keys and boot died with `nats: invalid key`. Switched to `.`. Cheap
+  bug, easy to hit — sanitize anything you put in a KV key.
+- **Queue groups ≠ iii's "latest registration wins."** NATS load-balances within
+  a queue group, so two instances of a worker *share* traffic. To truly
+  *replace* one you drain/stop the old instances — there's no implicit
+  most-recent-wins hot-swap. Arguably safer, but a different mental model.
+- **A detached durable turn can't reuse the request context.** `fn.run.start`
+  returns immediately and the turn runs on a background goroutine, so the
+  request's ctx (and its span) is already over. The trace root has to be
+  re-established on the goroutine (`obs.StartTurn`) or the turn shows up
+  parentless. Durability and tracing pull in opposite directions here.
+- **Trace propagation forced a transport detail.** Plain `nc.Request` carries no
+  headers, so `Trigger` had to switch to building a `nats.Msg` with headers +
+  `RequestMsgWithContext`. The propagation requirement reached down into how the
+  call is made.
+- **A catalogue miss shouldn't strand a provider.** A model id the static
+  catalogue doesn't know (e.g. a gateway-only model) first fell back to the
+  hard-coded Anthropic model — wrong provider. Fix was to make resolution
+  *trust the request* so any provider/model routes.
+- **Models do weird things; make them visible.** `gpt-5.5` occasionally returned
+  an empty assistant turn after a tool result. Not a bug in vent — but the run
+  trace hid it because it only printed text deltas. Surfacing stop-reasons and
+  errors in the trace made the behavior legible. Observability earns its keep
+  fast.
+
+### What we'd fix before trusting it
+
+- **Budget needs compare-and-swap.** The `budget` worker does best-effort
   read-modify-write on KV, which races under concurrent turns. JetStream KV has
-  revision-based compare-and-swap (`Update` with last revision) — the correct
-  fix, not yet applied here.
-- **Streaming maps cleanly.** A provider publishes token deltas to a core
-  subject the orchestrator subscribes to, and returns the final message as the
-  reply — live tokens + a clean result, no extra machinery.
-- **It's vibecoded.** Built mostly by an AI agent fanning out workers in
-  parallel against a frozen `pkg/types`/`pkg/bus` contract. That contract-first
-  split is *why* parallel generation worked — but coverage is light (one real
-  test), error handling is uneven, and nothing here has seen load. Concept
-  proven; production hardening not attempted.
+  revision-based CAS (`Update` with the last revision) — that's the right fix,
+  not yet applied.
+- **Approvals should watch, not poll.** The gate polls the approvals bucket every
+  500 ms; a KV *watch* is the truly reactive version (and what iii's
+  `turn::on_approval` does).
+- **Security for real multiplayer.** External workers currently connect
+  unauthenticated. Before opening the socket beyond localhost you'd want NATS
+  TLS + JWT/nkey auth and per-subject permissions — all native to NATS, just not
+  configured here.
+- **Compaction is naive** (token estimate = chars/4, one flat summary) and there
+  is **one real test** in the repo. Coverage and error-handling uniformity are
+  the obvious next debts.
+
+### Meta
+
+It's **vibecoded** — built mostly by an AI agent in a few iterations. The value
+isn't the code quality; it's that the architectural bet ("a harness is workers
+on a bus; swap a worker, not the harness") survived contact with a real,
+running, traced, multi-provider implementation. Concept proven; production
+hardening explicitly not attempted.
 
 ## Layout
 
