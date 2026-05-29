@@ -1,0 +1,17 @@
+# Build artifacts
+/vent
+/cmd/vent/vent
+*.exe
+
+# Local engine data (JetStream store dirs are created under temp at runtime)
+ventdata/
+*.store
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Go
+*.test
+*.out
