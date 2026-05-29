@@ -15,3 +15,7 @@ ventdata/
 # Go
 *.test
 *.out
+
+# stray compiled example binaries
+/external-worker
+/examples/external-worker/external-worker
